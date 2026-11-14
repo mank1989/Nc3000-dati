@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NC3000 · logger sola lettura</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 12px; background: #111; color: #eee; }
+  h3 { margin: 8px 0; }
+  h4 { margin: 16px 0 6px; }
+  button { padding: 10px 14px; margin: 4px 6px 4px 0; font-size: 16px; border: 0; border-radius: 8px; background: #1e88e5; color: #fff; }
+  button:disabled { background: #444; }
+  input, select { font-size: 16px; padding: 6px; background: #222; color: #eee; border: 1px solid #444; border-radius: 6px; }
+  input[type=number] { width: 90px; }
+  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 6px 0; }
+  .note { font-size: 13px; color: #aaa; }
+  canvas { width: 100%; height: 220px; background: #000; border-radius: 6px; display: block; }
+  #log { font-family: monospace; font-size: 12px; height: 180px; overflow: auto; background: #000; padding: 6px; white-space: pre; border-radius: 6px; }
+</style>
+</head>
+<body>
+
+<h3>NC3000 · sola lettura</h3>
+<p class="note">Questa pagina non scrive comandi sul caricabatterie. Attiva solo le notifiche della caratteristica 0000ffe1 e registra quello che arriva. Connetti azzera il registro della sessione precedente: esporta prima il CSV.</p>
+
+<div class="row">
+  <button id="btnConnect">Connetti</button>
+  <button id="btnStop" disabled>Ferma</button>
+  <button id="btnExport" disabled>Esporta CSV</button>
+</div>
+<p id="status">Non connesso</p>
+<p class="note">Pacchetti: <span id="count">0</span> · byte: <span id="bytes">0</span></p>
+
+<h4>Campo da tracciare</h4>
+<p class="note">Finché non conosciamo il formato dei pacchetti, prova offset e tipo: il grafico mostra quel campo nel tempo. Se il campo è la tensione in mV, con divisore 1000 vedrai valori tra 1,0 e 1,6.</p>
+<div class="row">
+  <label>Offset <input type="number" id="offset" value="0" min="0"></label>
+  <label>Tipo
+    <select id="type">
+      <option value="u8">uint8</option>
+      <option value="u16le" selected>uint16 LE</option>
+      <option value="u16be">uint16 BE</option>
+    </select>
+  </label>
+  <label>Divisore <input type="number" id="div" value="1000" min="1"></label>
+</div>
+<canvas id="chart"></canvas>
+
+<h4>Flusso grezzo</h4>
+<div id="log"></div>
+
+<script>
+const SVC = '0000ffe0-0000-1000-8000-00805f9b34fb';
+const CHR = '0000ffe1-0000-1000-8000-00805f9b34fb';
+const MAX_RECORDS = 200000;
+
+let device = null;
+let char = null;
+let records = [];
+let pktCount = 0;
+let totalBytes = 0;
+let t0 = 0;
+let lastDraw = 0;
+let logLines = [];
+
+const $ = id => document.getElementById(id);
+
+function toHex(bytes) {
+  return Array.from(bytes, b => b.toString(16).padStart(2, '0')).join(' ');
+}
+
+function addLog(line) {
+  logLines.push(line);
+  if (logLines.length > 150) logLines.shift();
+  $('log').textContent = logLines.join('\n');
+  $('log').scrollTop = $('log').scrollHeight;
+}
+
+function fieldValue(bytes, off, type) {
+  if (type === 'u8') return off < bytes.length ? bytes[off] : null;
+  if (off + 1 >= bytes.length) return null;
+  return type === 'u16le'
+    ? bytes[off] | (bytes[off + 1] << 8)
+    : (bytes[off] << 8) | bytes[off + 1];
+}
+
+function onData(ev) {
+  const dv = ev.target.value;
+  const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength).slice();
+  const t = (Date.now() - t0) / 1000;
+
+  records.push({ t, bytes });
+  if (records.length > MAX_RECORDS) records.shift();
+  pktCount++;
+  totalBytes += bytes.length;
+
+  $('count').textContent = pktCount;
+  $('bytes').textContent = totalBytes;
+  addLog(t.toFixed(1).padStart(8) + ' s  ' + toHex(bytes));
+
+  if (performance.now() - lastDraw > 500) {
+    lastDraw = performance.now();
+    drawChart();
+  }
+}
+
+function onDisconnect() {
+  $('status').textContent = 'Disconnesso: ' + pktCount + ' pacchetti registrati';
+  $('btnConnect').disabled = false;
+  $('btnStop').disabled = true;
+}
+
+async function connect() {
+  if (!window.isSecureContext || !navigator.bluetooth) {
+    $('status').textContent = 'Serve Chrome su HTTPS (es. GitHub Pages)';
+    return;
+  }
+  try {
+    $('status').textContent = 'Scelta dispositivo…';
+    device = await navigator.bluetooth.requestDevice({
+      filters: [{ namePrefix: '#Charger' }],
+      optionalServices: [SVC]
+    });
+    device.addEventListener('gattserverdisconnected', onDisconnect);
+
+    $('status').textContent = 'Connessione…';
+    const server = await device.gatt.connect();
+    const service = await server.getPrimaryService(SVC);
+    char = await service.getCharacteristic(CHR);
+
+    records = [];
+    pktCount = 0;
+    totalBytes = 0;
+    logLines = [];
+    t0 = Date.now();
+
+    char.addEventListener('characteristicvaluechanged', onData);
+    await char.startNotifications();
+
+    $('status').textContent = 'Registrazione in corso';
+    $('btnConnect').disabled = true;
+    $('btnStop').disabled = false;
+    $('btnExport').disabled = false;
+  } catch (e) {
+    $('status').textContent = 'Errore: ' + e.message;
+  }
+}
+
+async function stop() {
+  try {
+    if (char) {
+      char.removeEventListener('characteristicvaluechanged', onData);
+      await char.stopNotifications();
+    }
+    if (device && device.gatt.connected) device.gatt.disconnect();
+  } catch (e) {
+    // ignora: la connessione potrebbe essere già chiusa
+  }
+  $('status').textContent = 'Fermata: ' + pktCount + ' pacchetti registrati';
+  $('btnConnect').disabled = false;
+  $('btnStop').disabled = true;
+}
+
+function exportCsv() {
+  const off = parseInt($('offset').value, 10) || 0;
+  const type = $('type').value;
+  const div = parseFloat($('div').value) || 1;
+  const rows = ['tempo_s,lunghezza,hex,valore_campo'];
+  for (const r of records) {
+    const v = fieldValue(r.bytes, off, type);
+    rows.push([
+      r.t.toFixed(3),
+      r.bytes.length,
+      toHex(r.bytes).replace(/ /g, ''),
+      v === null ? '' : (v / div)
+    ].join(','));
+  }
+  const blob = new Blob([rows.join('\n')], { type: 'text/csv' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = 'nc3000_' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+function drawChart() {
+  const cv = $('chart');
+  const dpr = window.devicePixelRatio || 1;
+  const w = cv.clientWidth;
+  const h = cv.clientHeight;
+  cv.width = w * dpr;
+  cv.height = h * dpr;
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.fillStyle = '#000';
+  ctx.fillRect(0, 0, w, h);
+
+  const off = parseInt($('offset').value, 10) || 0;
+  const type = $('type').value;
+  const div = parseFloat($('div').value) || 1;
+
+  const pts = [];
+  for (let i = Math.max(0, records.length - 3000); i < records.length; i++) {
+    const v = fieldValue(records[i].bytes, off, type);
+    if (v !== null) pts.push([records[i].t, v / div]);
+  }
+
+  ctx.fillStyle = '#888';
+  ctx.font = '12px sans-serif';
+  if (pts.length < 2) {
+    ctx.fillText('nessun dato per questo campo', 10, 20);
+    return;
+  }
+
+  const ys = pts.map(p => p[1]);
+  let ymin = Math.min(...ys);
+  let ymax = Math.max(...ys);
+  if (ymax === ymin) { ymax += 1; ymin -= 1; }
+  const t1 = pts[0][0];
+  const t2 = pts[pts.length - 1][0];
+  const span = Math.max(t2 - t1, 1e-6);
+  const X = t => 40 + (t - t1) / span * (w - 50);
+  const Y = v => h - 20 - (v - ymin) / (ymax - ymin) * (h - 40);
+
+  ctx.strokeStyle = '#333';
+  ctx.beginPath();
+  ctx.moveTo(40, 10);
+  ctx.lineTo(40, h - 20);
+  ctx.lineTo(w - 10, h - 20);
+  ctx.stroke();
+
+  ctx.fillStyle = '#aaa';
+  ctx.fillText(ymax.toFixed(3), 2, 14);
+  ctx.fillText(ymin.toFixed(3), 2, h - 22);
+  ctx.fillText(span.toFixed(0) + ' s', w - 60, h - 6);
+
+  ctx.strokeStyle = '#4fc3f7';
+  ctx.lineWidth = 1.5;
+  ctx.beginPath();
+  pts.forEach((p, i) => {
+    const x = X(p[0]);
+    const y = Y(p[1]);
+    if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+  });
+  ctx.stroke();
+}
+
+$('btnConnect').onclick = connect;
+$('btnStop').onclick = stop;
+$('btnExport').onclick = exportCsv;
+$('offset').oninput = drawChart;
+$('type').onchange = drawChart;
+$('div').oninput = drawChart;
+
+drawChart();
+</script>
+</body>
+</html>
